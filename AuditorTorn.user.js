@@ -104,39 +104,45 @@ async function loadCatalog(){
   catalog[id]=x.name;
 }
 
-function findItem(q){
+/*
+ Devuelve todas las coincidencias (hasta 8),
+ para poder mostrar una lista de sugerencias
+ mientras el usuario escribe, en vez de exigir
+ una coincidencia única.
+*/
+function collectMatches(q){
+
  q=q.trim().toLowerCase();
 
- if(!q)return null;
+ if(!q)return [];
+
+ const seen=new Set();
+ const out=[];
+
+ function add(id,name){
+  if(seen.has(id))return;
+  seen.add(id);
+  out.push({id,name});
+ }
 
  if(/^\d+$/.test(q)&&catalog[q])
-  return q;
+  add(q,catalog[q]);
 
  for(const [id,x] of Object.entries(items)){
-  if(String(x.name||'').toLowerCase()===q)
-   return id;
+
+  const name=String(x.name||'');
+
+  if(name.toLowerCase().includes(q))
+   add(id,name);
  }
 
  for(const [id,n] of Object.entries(catalog)){
-  if(String(n).toLowerCase()===q)
-   return id;
+
+  if(String(n).toLowerCase().includes(q))
+   add(id,n);
  }
 
- const matches=Object.entries(items).filter(
-  ([id,x])=>String(x.name||'').toLowerCase().includes(q)
- );
-
- if(matches.length===1)
-  return matches[0][0];
-
- const catMatches=Object.entries(catalog).filter(
-  ([id,n])=>String(n).toLowerCase().includes(q)
- );
-
- if(catMatches.length===1)
-  return catMatches[0][0];
-
- return null;
+ return out.slice(0,8);
 }
 
 /* ---------- W3B ---------- */
@@ -186,12 +192,12 @@ async function getMarket(id){
 
 /* ---------- VALOR REAL ----------
 
-No usamos promedio global.
-
-Buscamos una zona donde los precios estén
-concentrados. Los saltos grandes separan
-grupos y los grupos pequeños/aislados no
-dominan el resultado.
+Usamos el 10% de los listings con menor
+precio para estimar el valor real de un
+artículo. Son los que realmente compiten
+por la venta; el resto del mercado (precios
+inflados, listados abandonados) no debería
+influir en el cálculo.
 */
 
 function getRealValue(listings){
@@ -204,96 +210,29 @@ function getRealValue(listings){
  if(!prices.length)
   throw Error('Sin precios válidos');
 
- const groups=[];
- let group=[prices[0]];
+ const count=
+  Math.max(1,Math.ceil(prices.length*0.10));
 
- for(let i=1;i<prices.length;i++){
-
-  const previous=prices[i-1];
-  const current=prices[i];
-
-  const gap=(current-previous)/
-            Math.max(previous,1);
-
-  if(gap<=0.08){
-   group.push(current);
-  }else{
-   groups.push(group);
-   group=[current];
-  }
- }
-
- groups.push(group);
-
- let best=groups[0];
- let bestScore=-1;
-
- for(const g of groups){
-
-  const middle=g[Math.floor(g.length/2)];
-
-  const spread=
-   (g[g.length-1]-g[0])/
-   Math.max(middle,1);
-
-  const score=
-   g.length*
-   (1-Math.min(spread,.8)*.35);
-
-  if(score>bestScore){
-   bestScore=score;
-   best=g;
-  }
- }
-
- /*
-  Si el grupo principal es demasiado pequeño,
-  buscamos grupos cercanos que pertenezcan
-  a la misma zona de mercado.
- */
- if(best.length<3){
-
-  const middle=best[Math.floor(best.length/2)];
-  const nearby=[];
-
-  for(const g of groups){
-
-   for(const price of g){
-
-    if(
-     Math.abs(price-middle)/
-     Math.max(middle,1)<=.18
-    ){
-     nearby.push(price);
-    }
-   }
-  }
-
-  if(nearby.length>best.length)
-   best=nearby.sort((a,b)=>a-b);
- }
+ const zone=prices.slice(0,count);
 
  const value=
-  best[Math.floor(best.length/2)];
+  zone[Math.floor(zone.length/2)];
 
  return {
   value:value,
-  low:best[0],
-  high:best[best.length-1],
+  low:zone[0],
+  high:zone[zone.length-1],
   total:prices.length,
-  zone:best.length
+  zone:zone.length
  };
 }
 
 function confidence(data){
 
- const ratio=data.zone/
-  Math.max(data.total,1);
-
- if(data.zone>=10&&ratio>=.25)
+ if(data.zone>=10)
   return 'Alta';
 
- if(data.zone>=5&&ratio>=.12)
+ if(data.zone>=4)
   return 'Media';
 
  return 'Baja';
@@ -464,20 +403,23 @@ function home(){
    <button id="at-history">
     📜 Historial
    </button>
-
-   <button id="at-sync">
-    ↻ W3B
-   </button>
   </div>
  `;
 
  const search=
   UI.content.querySelector('#at-search');
 
- search.addEventListener(
-  'input',
-  ()=>searchItem(search.value)
- );
+ search.addEventListener('input',()=>{
+
+  const r=
+   UI.content.querySelector('#at-result');
+
+  if(r&&search.value.trim())
+   r.innerHTML=
+    '<span class="muted">Buscando…</span>';
+
+  searchItem(search.value);
+ });
 
  UI.content.querySelector(
   '#at-settings'
@@ -486,24 +428,6 @@ function home(){
  UI.content.querySelector(
   '#at-history'
  ).onclick=()=>showHistory(selected);
-
- UI.content.querySelector(
-  '#at-sync'
- ).onclick=async()=>{
-
-  try{
-
-   const n=await syncW3B();
-
-   toast(
-    n+' precios sincronizados'
-   );
-
-  }catch(e){
-
-   toast(e.message);
-  }
- };
 
  /*
   Si ya había un artículo seleccionado,
@@ -550,65 +474,125 @@ async function searchItem(text){
  */
  searchTimer=setTimeout(async()=>{
 
-  let id=null;
-
   try{
    await loadCatalog();
   }catch{}
 
-  id=findItem(text);
-
-  if(!id){
-
-   const r=
-    UI.content.querySelector('#at-result');
-
-   if(r)
-    r.innerHTML=
-     '<span class="muted">Escribiendo…</span>';
-
-   return;
-  }
-
-  selected={
-   id:id,
-   ...(items[id]||{}),
-   name:
-    items[id]?.name||
-    catalog[id]||
-    text
-  };
+  const matches=collectMatches(text);
 
   const result=
    UI.content.querySelector('#at-result');
 
+  if(!result)
+   return;
+
+  if(!matches.length){
+
+   result.innerHTML=
+    '<span class="muted">Sin resultados.</span>';
+
+   return;
+  }
+
+  /*
+   Coincidencia única: se consulta
+   directamente, sin mostrar lista.
+  */
+  if(matches.length===1){
+
+   await selectItem(
+    matches[0].id,
+    matches[0].name
+   );
+
+   return;
+  }
+
+  /*
+   Varias coincidencias: mostramos
+   una lista de sugerencias clicable.
+  */
+  result.innerHTML=
+   '<div class="suggestions">'+
+   matches.map(m=>
+    '<div class="suggestion" data-id="'+
+    esc(m.id)+
+    '" data-name="'+
+    esc(m.name)+
+    '">'+
+    esc(m.name)+
+    '</div>'
+   ).join('')+
+   '</div>';
+
+  result.querySelectorAll(
+   '.suggestion'
+  ).forEach(row=>{
+
+   row.onclick=()=>{
+
+    const search=
+     UI.content.querySelector('#at-search');
+
+    if(search)
+     search.value=row.dataset.name;
+
+    selectItem(
+     row.dataset.id,
+     row.dataset.name
+    );
+   };
+  });
+
+ },350);
+}
+
+/*
+ Selecciona un artículo concreto
+ (desde una sugerencia o coincidencia
+ única) y dispara la auditoría.
+*/
+async function selectItem(id,name){
+
+ selected={
+  id:id,
+  ...(items[id]||{}),
+  name:
+   items[id]?.name||
+   name||
+   id
+ };
+
+ const result=
+  UI.content.querySelector('#at-result');
+
+ if(result)
   result.innerHTML=
    '<span class="muted">Consultando mercado…</span>';
 
-  try{
+ try{
 
-   /*
-    Si no hay auditoría reciente,
-    el artículo se consulta automáticamente.
-   */
-   const data=await audit(id);
+  /*
+   Si no hay auditoría reciente,
+   el artículo se consulta automáticamente.
+  */
+  const data=await audit(id);
 
-   selected={
-    id:id,
-    ...(items[id]||{})
-   };
+  selected={
+   id:id,
+   ...(items[id]||{})
+  };
 
-   renderItem(id,data);
+  renderItem(id,data);
 
-  }catch(e){
+ }catch(e){
 
+  if(result)
    result.innerHTML=
     '<span class="error">'+
     esc(e.message)+
     '</span>';
-  }
-
- },350);
+ }
 }
 
 /* ---------- RESULTADO ---------- */
@@ -855,6 +839,16 @@ function settings(){
 
   <hr>
 
+  <div>
+   Precios W3B
+  </div>
+
+  <button id="at-sync">
+   ↻ Sincronizar W3B
+  </button>
+
+  <hr>
+
   <div class="muted">
    La auditoría continúa en segundo plano
    y no cambiará esta pantalla.
@@ -864,6 +858,11 @@ function settings(){
  UI.content.querySelector(
   '#at-save'
  ).onclick=async()=>{
+
+  const saveBtn=
+   UI.content.querySelector('#at-save');
+
+  const original=saveBtn.textContent;
 
   api=
    UI.content.querySelector(
@@ -878,7 +877,49 @@ function settings(){
   await set(K.api,api);
   await set(K.uid,uid);
 
+  saveBtn.disabled=true;
+  saveBtn.textContent='Guardado ✓';
+
   toast('Configuración guardada');
+
+  setTimeout(()=>{
+   saveBtn.textContent=original;
+   saveBtn.disabled=false;
+  },900);
+ };
+
+ UI.content.querySelector(
+  '#at-sync'
+ ).onclick=async()=>{
+
+  const syncBtn=
+   UI.content.querySelector('#at-sync');
+
+  if(syncBtn.disabled)
+   return;
+
+  const original=syncBtn.textContent;
+
+  syncBtn.disabled=true;
+  syncBtn.textContent='Sincronizando…';
+
+  try{
+
+   const n=await syncW3B();
+
+   toast(
+    n+' precios sincronizados'
+   );
+
+  }catch(e){
+
+   toast(e.message);
+
+  }finally{
+
+   syncBtn.textContent=original;
+   syncBtn.disabled=false;
+  }
  };
 
  UI.content.querySelector(
@@ -1001,6 +1042,36 @@ function createUI(){
   background:#455a64;
   color:white;
   cursor:pointer;
+  transition:background .15s,transform .08s;
+ }
+
+ #at-panel button:active{
+  background:#37474f;
+  transform:scale(.96);
+ }
+
+ #at-panel button:disabled{
+  opacity:.55;
+  cursor:default;
+  transform:none;
+ }
+
+ #at-panel .suggestions{
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+ }
+
+ #at-panel .suggestion{
+  padding:7px 8px;
+  border-radius:5px;
+  background:#252525;
+  cursor:pointer;
+  transition:background .1s;
+ }
+
+ #at-panel .suggestion:active{
+  background:#37474f;
  }
 
  #at-panel .top{
@@ -1241,11 +1312,23 @@ function createUI(){
   }
  }
 
- /* ---------- MOUSE ---------- */
+ /* ---------- EVENTOS (Pointer Events) ----------
+
+ Usamos Pointer Events en lugar de mouse y touch
+ por separado. Mezclarlos causaba el bug donde
+ había que mantener presionado el botón: un toque
+ dispara touchstart/touchend reales y, además, el
+ navegador dispara mousedown/mouseup "fantasma"
+ poco después, provocando un doble toggle (se
+ abre y se cierra al instante). Con Pointer Events
+ solo hay un evento por gesto.
+ */
 
  button.addEventListener(
-  'mousedown',
+  'pointerdown',
   e=>{
+   button.setPointerCapture(e.pointerId);
+
    startDrag(
     e.clientX,
     e.clientY
@@ -1253,8 +1336,8 @@ function createUI(){
   }
  );
 
- document.addEventListener(
-  'mousemove',
+ button.addEventListener(
+  'pointermove',
   e=>{
    if(dragging)
     moveDrag(
@@ -1264,48 +1347,13 @@ function createUI(){
   }
  );
 
- document.addEventListener(
-  'mouseup',
+ button.addEventListener(
+  'pointerup',
   endDrag
  );
 
- /* ---------- TOUCH ---------- */
-
  button.addEventListener(
-  'touchstart',
-  e=>{
-   const t=e.touches[0];
-
-   startDrag(
-    t.clientX,
-    t.clientY
-   );
-
-  },
-  {passive:true}
- );
-
- document.addEventListener(
-  'touchmove',
-  e=>{
-
-   if(!dragging)
-    return;
-
-   const t=e.touches[0];
-
-   if(t)
-    moveDrag(
-     t.clientX,
-     t.clientY
-    );
-
-  },
-  {passive:true}
- );
-
- document.addEventListener(
-  'touchend',
+  'pointercancel',
   endDrag
  );
 

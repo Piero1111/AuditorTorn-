@@ -1,25 +1,20 @@
 # Changelog
 
-## [1.0.0] - 2026-08-08
-
-### Added
-- Botón flotante global en Torn.
-- Protección contra botones duplicados.
-- Sincronización con TornW3B.
-- Consulta de marketplace mediante `/marketplace/{itemId}`.
-- Estimación de valor real con listings y filtro IQR.
-- Cálculo del porcentaje efectivo de compra W3B.
-- Precio de compra recomendado.
-- Precio de venta recomendado.
-- Histórico local de precios.
-- Auditor pasivo.
-- Cola persistente de auditoría.
-- Resultados persistentes.
-- Indicador de alertas.
-- Búsqueda con sugerencias desde 2 caracteres.
-- Copiado rápido de precios.
+## 1.0.1 - 2026-08-08
 
 ### Fixed
-- Abrir la lupa ya no vuelve a ejecutar toda la auditoría.
-- Los resultados del auditor se muestran desde la información almacenada.
-- Se evita la creación de múltiples botones flotantes.
+- La búsqueda ya no depende exclusivamente de que el artículo haya sido auditado previamente.
+- Un artículo sin resultado se consulta bajo demanda.
+- Un resultado antiguo se muestra inmediatamente y se actualiza después.
+- La API Key y el Torn ID ya no ocupan espacio permanentemente en la interfaz.
+- La sincronización W3B se mueve a Configuración.
+
+### Added
+- Botón ⚙️ Configuración.
+- Botón 📈 Historial.
+- Vista individual del historial.
+- Consulta de precio bajo demanda desde el buscador.
+- Mejor separación entre búsqueda, auditor, historial y configuración.
+
+## 1.0.0 - 2026-08-08
+- Primera versión del auditor pasivo.

@@ -1,11 +1,13 @@
 // ==UserScript==
-// @name         AuditorTorn v1.0.3
+// @name         AuditorTorn
 // @namespace    torn-pda-auditor
 // @version      1.0.3
 // @description  Auditor de precios Torn/W3B
 // @match        https://www.torn.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @updateURL    https://raw.githubusercontent.com/Piero1111/AuditorTorn-/main/AuditorTorn.user.js
+// @downloadURL  https://raw.githubusercontent.com/Piero1111/AuditorTorn-/main/AuditorTorn.user.js
 // ==/UserScript==
 
 (function(){

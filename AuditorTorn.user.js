@@ -268,9 +268,14 @@ async function getMarket(id){
  if(!api)
   throw Error('Falta API Key');
 
+ /*
+  itemmarket solo existe en la API v2 de Torn,
+  no en v1 (de ahí el error "This selection is
+  only available in API v2" que tirar la v1).
+ */
  const d=await request(
-  'https://api.torn.com/market/'+id+
-  '?selections=itemmarket&key='+api
+  'https://api.torn.com/v2/market/'+id+
+  '/itemmarket?key='+api
  );
 
  if(d.error)
@@ -716,6 +721,34 @@ async function audit(id,force=false){
  }finally{
   busy.delete(id);
  }
+}
+
+/* ---------- RESET DE AUDITORÍAS ----------
+
+Borra todo lo calculado (audit guardado por
+item, histórico crudo y rollups diarios, y las
+marcas de "última auditoría") para arrancar de
+cero, como si el script nunca hubiera corrido.
+No toca la API Key, el Torn ID de W3B, ni los
+buyPrice/name sincronizados desde W3B.
+*/
+
+async function resetAudits(){
+
+ for(const id of Object.keys(items)){
+
+  const {audit,...rest}=items[id];
+
+  items[id]=rest;
+ }
+
+ hist={};
+ last={};
+
+ homeSelected=null;
+ auditSelected=null;
+
+ await save();
 }
 
 /* ---------- COPIAR ---------- */
@@ -1559,6 +1592,23 @@ function settings(){
 
   <hr>
 
+  <div>
+   Auditorías guardadas
+  </div>
+
+  <button id="at-reset">
+   🗑️ Borrar auditorías
+  </button>
+
+  <div class="muted">
+   Borra el valor calculado, el histórico y las
+   marcas de status guardadas por artículo.
+   No toca tu API Key, tu Torn ID ni los precios
+   de W3B sincronizados.
+  </div>
+
+  <hr>
+
   <div class="muted">
    La auditoría continúa en segundo plano
    y no cambiará esta pantalla.
@@ -1630,6 +1680,50 @@ function settings(){
    syncBtn.textContent=original;
    syncBtn.disabled=false;
   }
+ };
+
+ UI.content.querySelector(
+  '#at-reset'
+ ).onclick=async()=>{
+
+  const resetBtn=
+   UI.content.querySelector('#at-reset');
+
+  if(resetBtn.disabled)
+   return;
+
+  /*
+   Doble toque para confirmar: la primera
+   pulsación solo cambia el texto del botón,
+   la segunda (dentro de los siguientes 4s)
+   ejecuta el borrado. Así evitamos un borrado
+   accidental de un solo toque.
+  */
+  if(resetBtn.dataset.confirm!=='1'){
+
+   resetBtn.dataset.confirm='1';
+   resetBtn.textContent='¿Seguro? Tocá de nuevo';
+
+   setTimeout(()=>{
+    if(resetBtn.dataset.confirm==='1'){
+     resetBtn.dataset.confirm='';
+     resetBtn.textContent='🗑️ Borrar auditorías';
+    }
+   },4000);
+
+   return;
+  }
+
+  resetBtn.dataset.confirm='';
+  resetBtn.disabled=true;
+  resetBtn.textContent='Borrando…';
+
+  await resetAudits();
+
+  toast('Auditorías borradas');
+
+  resetBtn.disabled=false;
+  resetBtn.textContent='🗑️ Borrar auditorías';
  };
 
  UI.content.querySelector(

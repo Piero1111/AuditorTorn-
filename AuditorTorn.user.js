@@ -17,6 +17,17 @@ const BASE='https://weav3r.dev/api';
 const FRESH=60*60*1000;
 const PASSIVE=15*60*1000;
 
+/*
+ Identifica la metodología de cálculo usada.
+ Si el algoritmo cambia (como ahora, al pasar
+ a "10% más barato"), subimos este número para
+ que las auditorías guardadas con la versión
+ anterior se traten como caducadas y se vuelvan
+ a calcular, en vez de reutilizarse por hasta
+ 1 hora con un resultado obtenido de otra forma.
+*/
+const ALGO_VERSION=3;
+
 const K={
  api:'at_api',
  uid:'at_uid',
@@ -192,44 +203,119 @@ async function getMarket(id){
 
 /* ---------- VALOR REAL ----------
 
-Usamos el 10% de los listings con menor
-precio para estimar el valor real de un
-artículo. Son los que realmente compiten
-por la venta; el resto del mercado (precios
-inflados, listados abandonados) no debería
-influir en el cálculo.
+No todos los listings pesan igual: uno con
+433 unidades representa mucha más oferta real
+que uno con 1. Por eso ponderamos por cantidad.
+
+Pero un solo vendedor con stock masivo (una
+empresa liquidando, un dump, etc.) tampoco
+debería definir el precio él solo. Por eso
+limitamos cuánto puede "pesar" cada listing
+individual dentro de la zona barata.
+
+Método:
+ 1) Definimos la "zona alcanzable" como el
+    20% más barato de la cantidad total
+    disponible (no del número de listings).
+ 2) Ningún listing puede aportar más del 20%
+    de esa zona por sí solo (como máximo hacen
+    falta ~5 vendedores distintos para llenarla).
+ 3) El valor real es el precio en el punto
+    medio (por cantidad) de esa zona.
 */
 
 function getRealValue(listings){
 
- const prices=listings
-  .map(x=>Number(x.price))
-  .filter(x=>Number.isFinite(x)&&x>1)
-  .sort((a,b)=>a-b);
+ const raw=listings
+  .map(x=>({
+   price:Number(x.price),
+   qty:Math.max(
+    1,
+    Number(
+     x.quantity??
+     x.qty??
+     x.amount??
+     x.stock??
+     1
+    )
+   )
+  }))
+  .filter(x=>Number.isFinite(x.price)&&x.price>1)
+  .sort((a,b)=>a.price-b.price);
 
- if(!prices.length)
+ if(!raw.length)
   throw Error('Sin precios válidos');
 
- const count=
-  Math.max(1,Math.ceil(prices.length*0.10));
+ const totalQty=
+  raw.reduce((s,x)=>s+x.qty,0);
 
- const zone=prices.slice(0,count);
+ /*
+  Tamaño de la zona alcanzable:
+  20% de toda la cantidad disponible.
+ */
+ const target=
+  Math.max(1,Math.ceil(totalQty*0.20));
 
- const value=
-  zone[Math.floor(zone.length/2)];
+ /*
+  Ningún listing individual puede aportar
+  más del 20% de esa zona.
+ */
+ const cap=
+  Math.max(1,Math.floor(target*0.20));
+
+ const half=target/2;
+
+ let acc=0;
+ let value=raw[0].price;
+ let low=raw[0].price;
+ let high=raw[0].price;
+ let zoneCount=0;
+
+ for(const item of raw){
+
+  const weight=
+   Math.min(item.qty,cap);
+
+  const before=acc;
+  acc+=weight;
+
+  high=item.price;
+  zoneCount++;
+
+  /*
+   El "valor real" es el precio en el
+   punto donde la cantidad acumulada
+   cruza la mitad de la zona.
+  */
+  if(before<half&&acc>=half)
+   value=item.price;
+
+  if(acc>=target)
+   break;
+ }
 
  return {
   value:value,
-  low:zone[0],
-  high:zone[zone.length-1],
-  total:prices.length,
-  zone:zone.length
+  low:low,
+  high:high,
+  total:raw.length,
+  zone:zoneCount
  };
 }
 
 function confidence(data){
 
- if(data.zone>=10)
+ const spread=
+  (data.high-data.low)/
+  Math.max(data.value,1);
+
+ /*
+  Muchos listings no sirven de nada si
+  la zona termina siendo demasiado ancha:
+  eso significa que hizo falta subir mucho
+  en precio para juntar suficiente cantidad.
+ */
+ if(data.zone>=8&&spread<=0.6)
   return 'Alta';
 
  if(data.zone>=4)
@@ -291,6 +377,7 @@ async function audit(id,force=false){
  if(
   !force &&
   item.audit &&
+  item.audit.algo===ALGO_VERSION &&
   Date.now()-Number(item.audit.time||0)<FRESH
  ){
   return item.audit;
@@ -324,6 +411,7 @@ async function audit(id,force=false){
 
   const auditData={
    time:Date.now(),
+   algo:ALGO_VERSION,
    value:market.value,
    low:market.low,
    high:market.high,
@@ -713,6 +801,10 @@ function renderItem(id,a){
    Actualizado:
    ${new Date(a.time).toLocaleString()}
   </div>
+
+  <button id="at-refresh">
+   🔄 Actualizar
+  </button>
  `;
 
  result
@@ -723,6 +815,33 @@ function renderItem(id,a){
     button.dataset.copy
    );
   });
+
+ const refreshBtn=
+  result.querySelector('#at-refresh');
+
+ if(refreshBtn)
+  refreshBtn.onclick=async()=>{
+
+   if(refreshBtn.disabled)
+    return;
+
+   refreshBtn.disabled=true;
+   refreshBtn.textContent='Actualizando…';
+
+   try{
+
+    const data=await audit(id,true);
+
+    renderItem(id,data);
+
+   }catch(e){
+
+    toast(e.message);
+
+    refreshBtn.disabled=false;
+    refreshBtn.textContent='🔄 Actualizar';
+   }
+  };
 }
 
 /* ---------- HISTORIAL ---------- */

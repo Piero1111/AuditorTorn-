@@ -1,13 +1,13 @@
 // ==UserScript==
-// @name         Torn Bazaar Auto-Pricer
-// @namespace    torn-pda-bazaar-pricer
+// @name         Torn Auditor
+// @namespace    torn-pda-auditor
 // @version      1.0.0
 // @description  Auditor de precios y calculadora de compra/venta para Torn.
 // @match        https://www.torn.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @updateURL    https://raw.githubusercontent.com/TU_USUARIO/Torn-Bazaar-AutoPricer/main/TornBazaarAutoPricer.user.js
-// @downloadURL  https://raw.githubusercontent.com/TU_USUARIO/Torn-Bazaar-AutoPricer/main/TornBazaarAutoPricer.user.js
+// @updateURL    https://raw.githubusercontent.com/Piero1111/AuditorTorn/main/AuditorTorn.user.js
+// @downloadURL  https://raw.githubusercontent.com/Piero1111/AuditorTorn/main/AuditorTorn.user.js
 // ==/UserScript==
 
 (function () {

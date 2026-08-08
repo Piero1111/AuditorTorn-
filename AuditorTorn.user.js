@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AuditorTorn
 // @namespace    torn-pda-auditor
-// @version      1.0.3
+// @version      1.1.0
 // @description  Auditor de precios Torn/W3B
 // @match        https://www.torn.com/*
 // @grant        GM_setValue
@@ -19,15 +19,23 @@ const PASSIVE=15*60*1000;
 
 /*
  Identifica la metodología de cálculo usada.
- Si el algoritmo cambia (como ahora, al pasar
- a la mediana ponderada de toda la oferta),
- subimos este número para que las auditorías
- guardadas con la versión anterior se traten
- como caducadas y se vuelvan a calcular, en vez
- de reutilizarse por hasta 1 hora con un
- resultado obtenido de otra forma.
+ Subimos este número cada vez que cambia de
+ forma relevante cómo se obtienen los datos
+ o cómo se calcula el valor real, para que
+ las auditorías guardadas con una versión
+ anterior se traten como caducadas y se
+ vuelvan a calcular en vez de reutilizarse.
+
+ v5: el mercado ya no se lee de un agregador
+ de terceros (weav3r), sino directo de la API
+ oficial de Torn (/market/{id}?selections=
+ itemmarket). Además, calculate() ahora usa
+ la mediana del último día con histórico
+ (hist[id].daily) en vez del snapshot crudo,
+ cayendo al snapshot solo si todavía no hay
+ suficiente histórico.
 */
-const ALGO_VERSION=4;
+const ALGO_VERSION=5;
 
 const K={
  api:'at_api',
@@ -40,9 +48,23 @@ const K={
 
 let api='',uid='';
 let items={},hist={},last={};
-let selected=null;
+let homeSelected=null;
+let auditSelected=null;
 let busy=new Set();
 let UI=null;
+
+/*
+ Última interacción del usuario (búsqueda o
+ selección) en cualquiera de las dos pantallas.
+ El auditor pasivo respeta esta marca para no
+ competir por la API mientras el usuario está
+ buscando activamente.
+*/
+let lastInteraction=0;
+
+function touch(){
+ lastInteraction=Date.now();
+}
 
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -60,6 +82,22 @@ async function load(){
  try{items=JSON.parse(await get(K.items,'{}'))||{}}catch{items={}}
  try{hist=JSON.parse(await get(K.hist,'{}'))||{}}catch{hist={}}
  try{last=JSON.parse(await get(K.last,'{}'))||{}}catch{last={}}
+
+ /*
+  Migración: el formato viejo de hist[id] era
+  un array plano de observaciones. El nuevo es
+  {raw, daily, _rolledTo}. Si encontramos el
+  formato viejo, lo envolvemos sin perder datos.
+ */
+ for(const id of Object.keys(hist)){
+  if(Array.isArray(hist[id])){
+   hist[id]={
+    raw:hist[id],
+    daily:[],
+    _rolledTo:0
+   };
+  }
+ }
 }
 
 async function save(){
@@ -97,6 +135,11 @@ async function request(url){
 
 /* ---------- CATÁLOGO TORN ---------- */
 
+/*
+ catalog[id] = {name, mv}
+ mv viene de market_value, que es el mismo
+ valor oficial que Torn usa como "MV" del item.
+*/
 let catalog={};
 
 async function loadCatalog(){
@@ -113,7 +156,10 @@ async function loadCatalog(){
   throw Error(d.error.error);
 
  for(const [id,x] of Object.entries(d.items||{}))
-  catalog[id]=x.name;
+  catalog[id]={
+   name:x.name,
+   mv:Number(x.market_value||0)
+  };
 }
 
 /*
@@ -138,7 +184,7 @@ function collectMatches(q){
  }
 
  if(/^\d+$/.test(q)&&catalog[q])
-  add(q,catalog[q]);
+  add(q,catalog[q].name);
 
  for(const [id,x] of Object.entries(items)){
 
@@ -148,13 +194,39 @@ function collectMatches(q){
    add(id,name);
  }
 
- for(const [id,n] of Object.entries(catalog)){
+ for(const [id,x] of Object.entries(catalog)){
 
-  if(String(n).toLowerCase().includes(q))
-   add(id,n);
+  if(String(x.name).toLowerCase().includes(q))
+   add(id,x.name);
  }
 
  return out.slice(0,8);
+}
+
+function renderSuggestions(container,matches,onPick){
+
+ container.innerHTML=
+  '<div class="suggestions">'+
+  matches.map(m=>
+   '<div class="suggestion" data-id="'+
+   esc(m.id)+
+   '" data-name="'+
+   esc(m.name)+
+   '">'+
+   esc(m.name)+
+   '</div>'
+  ).join('')+
+  '</div>';
+
+ container.querySelectorAll(
+  '.suggestion'
+ ).forEach(row=>{
+
+  row.onclick=()=>onPick(
+   row.dataset.id,
+   row.dataset.name
+  );
+ });
 }
 
 /* ---------- W3B ---------- */
@@ -189,17 +261,27 @@ async function syncW3B(){
  return count;
 }
 
-/* ---------- MERCADO ---------- */
+/* ---------- MERCADO (API oficial de Torn) ---------- */
 
 async function getMarket(id){
+
+ if(!api)
+  throw Error('Falta API Key');
+
  const d=await request(
-  BASE+'/marketplace/'+id+'?limit=100'
+  'https://api.torn.com/market/'+id+
+  '?selections=itemmarket&key='+api
  );
 
- if(!d||!Array.isArray(d.listings))
-  throw Error(d?.message||'Mercado inválido');
+ if(d.error)
+  throw Error(d.error.error);
 
- return d;
+ const im=d.itemmarket;
+
+ if(!im||!Array.isArray(im.listings))
+  throw Error('Mercado inválido');
+
+ return im;
 }
 
 /* ---------- VALOR REAL ----------
@@ -237,7 +319,7 @@ function getRealValue(listings){
 
  const raw=listings
   .map(x=>({
-   price:Number(x.price),
+   price:Number(x.price??x.cost),
    qty:Math.max(
     1,
     Number(
@@ -335,9 +417,153 @@ function confidence(data){
  return 'Baja';
 }
 
+/* ---------- HISTÓRICO / ROLLUP DIARIO ----------
+
+hist[id] = {raw, daily, _rolledTo}
+
+raw: cada observación cruda de auditoría
+ (time, value, low, high).
+
+daily: rollup por día (mediana de los "value"
+ observados ese día), recalculado de forma
+ perezosa: solo si raw creció desde la última
+ vez que se armó daily (_rolledTo guarda el
+ largo de raw en ese momento).
+*/
+
+function dayKey(ts){
+
+ const d=new Date(ts);
+
+ return d.getFullYear()+'-'+
+  String(d.getMonth()+1).padStart(2,'0')+'-'+
+  String(d.getDate()).padStart(2,'0');
+}
+
+function median(arr){
+
+ const s=arr.slice().sort((a,b)=>a-b);
+ const n=s.length;
+
+ if(!n)return null;
+
+ const mid=Math.floor(n/2);
+
+ return n%2
+  ?s[mid]
+  :(s[mid-1]+s[mid])/2;
+}
+
+function ensureDaily(id){
+
+ const h=hist[id];
+
+ if(!h)return [];
+
+ if(h._rolledTo===h.raw.length)
+  return h.daily;
+
+ const byDay={};
+
+ for(const r of h.raw){
+  const k=dayKey(r.time);
+  (byDay[k]=byDay[k]||[]).push(r);
+ }
+
+ h.daily=Object.keys(byDay)
+  .sort()
+  .map(k=>{
+
+   const rows=byDay[k];
+
+   return {
+    day:k,
+    median:median(rows.map(x=>x.value)),
+    low:Math.min(...rows.map(x=>x.low)),
+    high:Math.max(...rows.map(x=>x.high)),
+    count:rows.length
+   };
+  });
+
+ h._rolledTo=h.raw.length;
+
+ return h.daily;
+}
+
+function latestDaily(id){
+
+ const daily=ensureDaily(id);
+
+ return daily.length
+  ?daily[daily.length-1]
+  :null;
+}
+
+/*
+ Dashboard de 5 ventanas para el historial:
+ Hoy, 7 días, 30 días, 90 días y Todo.
+*/
+const WINDOWS=[
+ {label:'Hoy',ms:24*60*60*1000},
+ {label:'7 días',ms:7*24*60*60*1000},
+ {label:'30 días',ms:30*24*60*60*1000},
+ {label:'90 días',ms:90*24*60*60*1000},
+ {label:'Todo',ms:Infinity}
+];
+
+function windowStats(id){
+
+ const h=hist[id];
+
+ if(!h)return [];
+
+ const now=Date.now();
+
+ return WINDOWS.map(w=>{
+
+  const rows=h.raw.filter(r=>
+   w.ms===Infinity||now-r.time<=w.ms
+  );
+
+  return {
+   label:w.label,
+   median:median(rows.map(x=>x.value)),
+   count:rows.length
+  };
+ });
+}
+
 /* ---------- CÁLCULOS ---------- */
 
-function calculate(item,market){
+function statusFor(c){
+
+ const diff=
+  ((c.buy-c.recommendedBuy)/
+   Math.max(c.recommendedBuy,1))*100;
+
+ if(diff>20)return '🔴 Revisar';
+ if(diff>8)return '🟡 Vigilar';
+
+ return '🟢 Correcto';
+}
+
+function severity(s){
+
+ if(s==='🔴 Revisar')return 2;
+ if(s==='🟡 Vigilar')return 1;
+
+ return 0;
+}
+
+/*
+ refValue es el precio de referencia para
+ compra y venta recomendadas: la mediana del
+ último día con histórico si ya existe, o el
+ snapshot crudo del mercado si todavía no hay
+ suficiente histórico (primera auditoría del
+ item, por ejemplo).
+*/
+function calculate(item,market,daily){
 
  const mv=Number(item.mv||0);
  const buy=Number(item.buyPrice||0);
@@ -347,12 +573,15 @@ function calculate(item,market){
 
  const effective=buy/mv;
 
+ const usingDaily=daily!=null;
+ const refValue=usingDaily?daily.median:market.value;
+
  /*
   Compra:
-  valor real × porcentaje W3B
+  valor de referencia × porcentaje W3B
  */
  const recommendedBuy=
-  Math.round(market.value*effective);
+  Math.round(refValue*effective);
 
  /*
   Descuento de compra = 1-effective
@@ -362,18 +591,22 @@ function calculate(item,market){
 
  const recommendedSell=
   Math.round(
-   market.value*(1-sellDiscount)
+   refValue*(1-sellDiscount)
   );
 
  return {
   mv,
   buy,
   effective,
+  sellDiscount,
+  refValue,
+  usingDaily,
   recommendedBuy,
   recommendedSell
  };
-  }
- /* ---------- AUDITORÍA ---------- */
+}
+
+/* ---------- AUDITORÍA ---------- */
 
 async function audit(id,force=false){
 
@@ -398,38 +631,59 @@ async function audit(id,force=false){
 
  try{
 
-  const data=await getMarket(id);
+  try{await loadCatalog()}catch{}
 
-  const market=getRealValue(data.listings);
+  const im=await getMarket(id);
+
+  const market=getRealValue(im.listings);
+
+  const cat=catalog[id];
 
   const updated={
    ...item,
-   name:item.name||data.item_name,
+   name:item.name||cat?.name||im.item?.name,
    mv:Number(
-    data.market_price||
+    cat?.mv||
+    im.item?.average_price||
     item.mv||
     0
-   ),
-   bazaarAverage:Number(
-    data.bazaar_average||0
    )
   };
 
-  const calc=calculate(
-   updated,
-   market
-  );
+  if(!hist[id])
+   hist[id]={raw:[],daily:[],_rolledTo:0};
+
+  hist[id].raw.push({
+   time:Date.now(),
+   value:market.value,
+   low:market.low,
+   high:market.high
+  });
+
+  if(hist[id].raw.length>500)
+   hist[id].raw=hist[id].raw.slice(-500);
+
+  const daily=latestDaily(id);
+
+  const calc=calculate(updated,market,daily);
+
+  const status=calc?statusFor(calc):null;
+
+  const prevStatus=item.audit?.status;
 
   const auditData={
    time:Date.now(),
    algo:ALGO_VERSION,
-   value:market.value,
+   value:calc?calc.refValue:market.value,
+   snapshotValue:market.value,
    low:market.low,
    high:market.high,
    total:market.total,
    zone:market.zone,
    confidence:confidence(market),
-   calc:calc
+   usingDaily:!!daily,
+   calc:calc,
+   status:status
   };
 
   items[id]={
@@ -437,26 +691,25 @@ async function audit(id,force=false){
    audit:auditData
   };
 
-  if(!hist[id])
-   hist[id]=[];
-
-  /*
-   Guardamos solamente observaciones
-   obtenidas con esta metodología.
-  */
-  hist[id].push({
-   time:auditData.time,
-   value:auditData.value,
-   low:auditData.low,
-   high:auditData.high
-  });
-
-  if(hist[id].length>100)
-   hist[id]=hist[id].slice(-100);
-
   last[id]=Date.now();
 
   await save();
+
+  /*
+   Aviso automático cuando el status empeora,
+   sin importar en qué pantalla esté el usuario
+   ni si vino de una auditoría pasiva o manual.
+  */
+  if(
+   status&&
+   prevStatus&&
+   severity(status)>severity(prevStatus)
+  ){
+   toast(
+    '⚠️ '+(updated.name||id)+
+    ': empeoró a '+status
+   );
+  }
 
   return auditData;
 
@@ -481,17 +734,30 @@ async function copyPrice(value){
  }
 }
 
-/* ---------- VISTA PRINCIPAL ---------- */
+/* ---------- VISTA HOME (🏠, liviano) ----------
+
+Home solo muestra:
+ - Valor del item → MV oficial de Torn.
+ - Precio de compra → buyPrice de W3B tal cual
+   está guardado, sin corregir (la corrección
+   real vive en Auditoría).
+ - Venta recomendada → misma fórmula de
+   siempre, asumiendo que el W3B ya está bien.
+*/
 
 function home(){
 
  UI.content.innerHTML=`
+  <div class="nav">
+   <button id="at-nav-audit">📊 Auditoría</button>
+   <button id="at-settings">⚙️</button>
+  </div>
+
   <div class="top">
    <input
     id="at-search"
     placeholder="Buscar artículo..."
     autocomplete="off">
-   <button id="at-settings">⚙️</button>
   </div>
 
   <div id="at-result" class="result">
@@ -510,6 +776,8 @@ function home(){
 
  search.addEventListener('input',()=>{
 
+  touch();
+
   const r=
    UI.content.querySelector('#at-result');
 
@@ -517,8 +785,12 @@ function home(){
    r.innerHTML=
     '<span class="muted">Buscando…</span>';
 
-  searchItem(search.value);
+  homeSearch(search.value);
  });
+
+ UI.content.querySelector(
+  '#at-nav-audit'
+ ).onclick=auditHome;
 
  UI.content.querySelector(
   '#at-settings'
@@ -526,36 +798,34 @@ function home(){
 
  UI.content.querySelector(
   '#at-history'
- ).onclick=()=>showHistory(selected);
+ ).onclick=()=>showHistory(homeSelected,home);
 
  /*
-  Si ya había un artículo seleccionado,
-  conservamos el contexto.
+  Si ya había un artículo seleccionado en
+  Home, conservamos el contexto.
  */
- if(selected){
+ if(homeSelected){
 
   search.value=
-   selected.name||'';
+   homeSelected.name||'';
 
-  renderItem(
-   selected.id,
-   items[selected.id]?.audit
+  renderHomeItem(
+   homeSelected.id,
+   items[homeSelected.id]?.audit
   );
  }
 }
 
-/* ---------- BÚSQUEDA ---------- */
+let homeSearchTimer=null;
 
-let searchTimer=null;
+async function homeSearch(text){
 
-async function searchItem(text){
-
- clearTimeout(searchTimer);
+ clearTimeout(homeSearchTimer);
 
  text=text.trim();
 
  if(!text){
-  selected=null;
+  homeSelected=null;
 
   const r=
    UI.content.querySelector('#at-result');
@@ -567,11 +837,7 @@ async function searchItem(text){
   return;
  }
 
- /*
-  Esperamos un poco para no auditar
-  con cada letra escrita.
- */
- searchTimer=setTimeout(async()=>{
+ homeSearchTimer=setTimeout(async()=>{
 
   try{
    await loadCatalog();
@@ -593,13 +859,9 @@ async function searchItem(text){
    return;
   }
 
-  /*
-   Coincidencia única: se consulta
-   directamente, sin mostrar lista.
-  */
   if(matches.length===1){
 
-   await selectItem(
+   await selectHomeItem(
     matches[0].id,
     matches[0].name
    );
@@ -607,53 +869,25 @@ async function searchItem(text){
    return;
   }
 
-  /*
-   Varias coincidencias: mostramos
-   una lista de sugerencias clicable.
-  */
-  result.innerHTML=
-   '<div class="suggestions">'+
-   matches.map(m=>
-    '<div class="suggestion" data-id="'+
-    esc(m.id)+
-    '" data-name="'+
-    esc(m.name)+
-    '">'+
-    esc(m.name)+
-    '</div>'
-   ).join('')+
-   '</div>';
+  renderSuggestions(result,matches,(id,name)=>{
 
-  result.querySelectorAll(
-   '.suggestion'
-  ).forEach(row=>{
+   const search=
+    UI.content.querySelector('#at-search');
 
-   row.onclick=()=>{
+   if(search)
+    search.value=name;
 
-    const search=
-     UI.content.querySelector('#at-search');
-
-    if(search)
-     search.value=row.dataset.name;
-
-    selectItem(
-     row.dataset.id,
-     row.dataset.name
-    );
-   };
+   selectHomeItem(id,name);
   });
 
  },350);
 }
 
-/*
- Selecciona un artículo concreto
- (desde una sugerencia o coincidencia
- única) y dispara la auditoría.
-*/
-async function selectItem(id,name){
+async function selectHomeItem(id,name){
 
- selected={
+ touch();
+
+ homeSelected={
   id:id,
   ...(items[id]||{}),
   name:
@@ -671,18 +905,14 @@ async function selectItem(id,name){
 
  try{
 
-  /*
-   Si no hay auditoría reciente,
-   el artículo se consulta automáticamente.
-  */
   const data=await audit(id);
 
-  selected={
+  homeSelected={
    id:id,
    ...(items[id]||{})
   };
 
-  renderItem(id,data);
+  renderHomeItem(id,data);
 
  }catch(e){
 
@@ -694,13 +924,13 @@ async function selectItem(id,name){
  }
 }
 
-/* ---------- RESULTADO ---------- */
-
-function renderItem(id,a){
+function renderHomeItem(id,a){
 
  const item=items[id]||{};
  const result=
   UI.content.querySelector('#at-result');
+
+ if(!result)return;
 
  if(!a){
 
@@ -724,21 +954,331 @@ function renderItem(id,a){
   return;
  }
 
- /*
-  Diferencia entre el precio W3B
-  y el precio recomendado.
- */
- const difference=
-  ((c.buy-c.recommendedBuy)/
-   Math.max(c.recommendedBuy,1))*100;
+ result.innerHTML=`
 
- let status='🟢 Correcto';
+  <div class="title">
+   ${esc(item.name||id)}
+  </div>
 
- if(difference>20)
-  status='🔴 Revisar';
+  <div>
+   Valor del item:
+   <b>${money(c.mv)}</b>
+  </div>
 
- else if(difference>8)
-  status='🟡 Vigilar';
+  <div>
+   Precio de compra:
+   <b>${money(c.buy)}</b>
+  </div>
+
+  <hr>
+
+  <div class="recommend sell">
+   Venta recomendada
+   (${percent(c.sellDiscount*100)} desc.)
+   <b>${money(c.recommendedSell)}</b>
+
+   <button
+    class="copy"
+    data-copy="${c.recommendedSell}">
+    📋
+   </button>
+  </div>
+
+  ${
+   !c.usingDaily
+   ?'<div class="muted">Sin histórico suficiente todavía, usando snapshot actual.</div>'
+   :''
+  }
+
+  <div class="muted">
+   Actualizado:
+   ${new Date(a.time).toLocaleString()}
+  </div>
+ `;
+
+ result
+  .querySelectorAll('[data-copy]')
+  .forEach(button=>{
+
+   button.onclick=()=>copyPrice(
+    button.dataset.copy
+   );
+  });
+}
+
+/* ---------- VISTA AUDITORÍA (📊, nuevo) ----------
+
+Auditoría tiene su propia búsqueda y su propia
+selección (auditSelected), independiente de
+Home. Muestra la vista enfocada en compra:
+MV, W3B compra, Valor real, Compra recomendada
+con %, Confianza y status.
+
+Sin búsqueda activa, muestra la lista de items
+con observaciones guardadas en estado 🟡/🔴.
+*/
+
+function auditHome(){
+
+ UI.content.innerHTML=`
+
+  <div class="nav">
+   <button id="at-nav-home">🏠 Inicio</button>
+  </div>
+
+  <div class="title">
+   📊 Auditoría
+  </div>
+
+  <div class="top">
+   <input
+    id="at-audit-search"
+    placeholder="Buscar artículo..."
+    autocomplete="off">
+  </div>
+
+  <div id="at-audit-result" class="result">
+  </div>
+ `;
+
+ UI.content.querySelector(
+  '#at-nav-home'
+ ).onclick=home;
+
+ const search=
+  UI.content.querySelector('#at-audit-search');
+
+ search.addEventListener('input',()=>{
+
+  touch();
+
+  const r=
+   UI.content.querySelector('#at-audit-result');
+
+  if(r&&search.value.trim())
+   r.innerHTML=
+    '<span class="muted">Buscando…</span>';
+
+  auditSearch(search.value);
+ });
+
+ if(auditSelected){
+
+  search.value=
+   auditSelected.name||'';
+
+  renderAuditItem(
+   auditSelected.id,
+   items[auditSelected.id]?.audit
+  );
+
+ }else{
+
+  renderFlaggedList();
+ }
+}
+
+/*
+ Lista de items auditados cuyo último status
+ guardado no es 🟢, para revisar de un vistazo
+ qué está desalineado sin tener que buscar
+ artículo por artículo.
+*/
+function renderFlaggedList(){
+
+ const result=
+  UI.content.querySelector('#at-audit-result');
+
+ if(!result)return;
+
+ const flagged=Object.entries(items)
+  .filter(([id,it])=>
+   it.audit&&
+   it.audit.status&&
+   it.audit.status!=='🟢 Correcto'
+  )
+  .sort((a,b)=>
+   severity(b[1].audit.status)-
+   severity(a[1].audit.status)
+  );
+
+ if(!flagged.length){
+
+  result.innerHTML=
+   '<span class="muted">'+
+   'Sin observaciones guardadas. Todo en orden.'+
+   '</span>';
+
+  return;
+ }
+
+ result.innerHTML=
+  '<div class="suggestions">'+
+  flagged.map(([id,it])=>
+   '<div class="suggestion" data-id="'+
+   esc(id)+
+   '" data-name="'+
+   esc(it.name||id)+
+   '">'+
+   it.audit.status+' '+
+   esc(it.name||id)+
+   '</div>'
+  ).join('')+
+  '</div>';
+
+ result.querySelectorAll(
+  '.suggestion'
+ ).forEach(row=>{
+
+  row.onclick=()=>{
+
+   const search=
+    UI.content.querySelector('#at-audit-search');
+
+   if(search)
+    search.value=row.dataset.name;
+
+   selectAuditItem(
+    row.dataset.id,
+    row.dataset.name
+   );
+  };
+ });
+}
+
+let auditSearchTimer=null;
+
+async function auditSearch(text){
+
+ clearTimeout(auditSearchTimer);
+
+ text=text.trim();
+
+ if(!text){
+
+  auditSelected=null;
+
+  renderFlaggedList();
+
+  return;
+ }
+
+ auditSearchTimer=setTimeout(async()=>{
+
+  try{
+   await loadCatalog();
+  }catch{}
+
+  const matches=collectMatches(text);
+
+  const result=
+   UI.content.querySelector('#at-audit-result');
+
+  if(!result)
+   return;
+
+  if(!matches.length){
+
+   result.innerHTML=
+    '<span class="muted">Sin resultados.</span>';
+
+   return;
+  }
+
+  if(matches.length===1){
+
+   await selectAuditItem(
+    matches[0].id,
+    matches[0].name
+   );
+
+   return;
+  }
+
+  renderSuggestions(result,matches,(id,name)=>{
+
+   const search=
+    UI.content.querySelector('#at-audit-search');
+
+   if(search)
+    search.value=name;
+
+   selectAuditItem(id,name);
+  });
+
+ },350);
+}
+
+async function selectAuditItem(id,name){
+
+ touch();
+
+ auditSelected={
+  id:id,
+  ...(items[id]||{}),
+  name:
+   items[id]?.name||
+   name||
+   id
+ };
+
+ const result=
+  UI.content.querySelector('#at-audit-result');
+
+ if(result)
+  result.innerHTML=
+   '<span class="muted">Consultando mercado…</span>';
+
+ try{
+
+  const data=await audit(id);
+
+  auditSelected={
+   id:id,
+   ...(items[id]||{})
+  };
+
+  renderAuditItem(id,data);
+
+ }catch(e){
+
+  if(result)
+   result.innerHTML=
+    '<span class="error">'+
+    esc(e.message)+
+    '</span>';
+ }
+}
+
+function renderAuditItem(id,a){
+
+ const item=items[id]||{};
+ const result=
+  UI.content.querySelector('#at-audit-result');
+
+ if(!result)return;
+
+ if(!a){
+
+  result.innerHTML=
+   '<span class="muted">'+
+   'Aún no hay datos de mercado.'+
+   '</span>';
+
+  return;
+ }
+
+ const c=a.calc;
+
+ if(!c){
+
+  result.innerHTML=
+   '<span class="error">'+
+   'No se pudo calcular el precio.'+
+   '</span>';
+
+  return;
+ }
 
  result.innerHTML=`
 
@@ -764,8 +1304,9 @@ function renderItem(id,a){
   <hr>
 
   <div>
-   Valor real estimado:
-   <b>${money(a.value)}</b>
+   Valor real
+   ${c.usingDaily?'(mediana del día)':'(snapshot)'}:
+   <b>${money(c.refValue)}</b>
   </div>
 
   <div class="muted">
@@ -782,8 +1323,15 @@ function renderItem(id,a){
    ${a.confidence}
   </div>
 
+  ${
+   !c.usingDaily
+   ?'<div class="muted">Sin histórico suficiente todavía, usando snapshot actual.</div>'
+   :''
+  }
+
   <div class="recommend">
    Compra recomendada
+   (${percent(c.effective*100)})
    <b>${money(c.recommendedBuy)}</b>
 
    <button
@@ -793,19 +1341,8 @@ function renderItem(id,a){
    </button>
   </div>
 
-  <div class="recommend sell">
-   Venta recomendada
-   <b>${money(c.recommendedSell)}</b>
-
-   <button
-    class="copy"
-    data-copy="${c.recommendedSell}">
-    📋
-   </button>
-  </div>
-
   <div class="status">
-   ${status}
+   ${a.status}
   </div>
 
   <div class="muted">
@@ -813,9 +1350,15 @@ function renderItem(id,a){
    ${new Date(a.time).toLocaleString()}
   </div>
 
-  <button id="at-refresh">
-   🔄 Actualizar
-  </button>
+  <div class="buttons">
+   <button id="at-audit-history">
+    📜 Historial
+   </button>
+
+   <button id="at-audit-refresh">
+    🔄 Actualizar
+   </button>
+  </div>
  `;
 
  result
@@ -827,8 +1370,12 @@ function renderItem(id,a){
    );
   });
 
+ result.querySelector(
+  '#at-audit-history'
+ ).onclick=()=>showHistory(auditSelected,auditHome);
+
  const refreshBtn=
-  result.querySelector('#at-refresh');
+  result.querySelector('#at-audit-refresh');
 
  if(refreshBtn)
   refreshBtn.onclick=async()=>{
@@ -843,7 +1390,7 @@ function renderItem(id,a){
 
     const data=await audit(id,true);
 
-    renderItem(id,data);
+    renderAuditItem(id,data);
 
    }catch(e){
 
@@ -855,13 +1402,21 @@ function renderItem(id,a){
   };
 }
 
-/* ---------- HISTORIAL ---------- */
+/* ---------- HISTORIAL (compartido) ----------
 
-function showHistory(article){
+Se usa desde Home (historial del último item
+buscado en Home) y desde Auditoría (historial
+del item enfocado en esa pantalla). backFn
+decide a qué pantalla vuelve el botón "Volver".
+*/
+
+function showHistory(article,backFn){
+
+ backFn=backFn||home;
 
  if(!article){
 
-  home();
+  backFn();
 
   toast(
    'Primero busca un artículo'
@@ -876,10 +1431,13 @@ function showHistory(article){
   article.name||
   id;
 
- const data=
-  (hist[id]||[])
+ const raw=(hist[id]&&hist[id].raw)||[];
+ const windows=windowStats(id);
+
+ const recent=raw
   .slice()
-  .reverse();
+  .reverse()
+  .slice(0,30);
 
  UI.content.innerHTML=`
 
@@ -895,12 +1453,34 @@ function showHistory(article){
    ← Volver
   </button>
 
+  <div class="windows">
+
+   ${
+    windows.map(w=>`
+      <div class="historyRow">
+
+       <b>
+        ${w.median!=null?money(w.median):'—'}
+       </b>
+
+       <span>
+        ${w.label} · ${w.count}
+       </span>
+
+      </div>
+     `).join('')
+   }
+
+  </div>
+
+  <hr>
+
   <div class="history">
 
    ${
-    data.length
+    recent.length
 
-    ?data.map(x=>`
+    ?recent.map(x=>`
       <div class="historyRow">
 
        <b>
@@ -926,7 +1506,7 @@ function showHistory(article){
 
  UI.content.querySelector(
   '#at-back'
- ).onclick=home;
+ ).onclick=backFn;
 }
 
 /* ---------- CONFIGURACIÓN ---------- */
@@ -1064,7 +1644,7 @@ function toast(text){
  const t=
   document.createElement('div');
 
- t.className='toast';
+ t.className='at-toast';
  t.textContent=text;
 
  document.body.appendChild(t);
@@ -1074,7 +1654,8 @@ function toast(text){
   1600
  );
 }
- /* ---------- INTERFAZ ---------- */
+
+/* ---------- INTERFAZ ---------- */
 
 function createUI(){
 
@@ -1184,6 +1765,12 @@ function createUI(){
   opacity:.55;
   cursor:default;
   transform:none;
+ }
+
+ #at-panel .nav{
+  display:flex;
+  justify-content:space-between;
+  margin-bottom:6px;
  }
 
  #at-panel .suggestions{
@@ -1509,6 +2096,15 @@ async function passiveAudit(){
   return;
 
  if(!api)
+  return;
+
+ /*
+  Prioridad de búsqueda: si el usuario tuvo
+  actividad hace poco (búsqueda o selección
+  en Home o en Auditoría), no competimos por
+  la API con la auditoría pasiva en este ciclo.
+ */
+ if(Date.now()-lastInteraction<4000)
   return;
 
  passiveRunning=true;
